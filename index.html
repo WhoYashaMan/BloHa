@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Блоха — дайс-трей v3</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%B2%3C/text%3E%3C/svg%3E">
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #1b1830;
+    --ink: #f4f1e8;
+    --dim: #8d88aa;
+    --gold: #e8b84a;
+    --red: #e23535;
+    --blue: #2f5bdc;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    color-scheme: dark;
+  }
+  html { height: 100%; background: var(--bg); scroll-padding-top: env(safe-area-inset-top, 0px); }
+  body {
+    margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font-family: 'Press Start 2P', ui-monospace, Menlo, Consolas, monospace;
+    overflow: hidden; touch-action: manipulation; -webkit-user-select: none; user-select: none;
+  }
+  #stage { position: relative; margin: 0 auto; }
+  canvas { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
+  #hud { position: absolute; left: 0; right: 0; text-align: center; pointer-events: none; }
+  #result { font-size: 20px; letter-spacing: 6px; min-height: 28px; line-height: 28px; }
+  #combo { font-size: 14px; line-height: 20px; color: var(--gold); min-height: 20px; margin-top: 12px; }
+  #meterWrap { width: 120px; height: 10px; margin: 14px auto 0; border: 2px solid var(--dim); padding: 2px; }
+  #meter { height: 100%; width: 0; background: var(--gold); }
+  #status { font-size: 10px; margin-top: 12px; line-height: 16px; }
+  #sensor { font-size: 8px; color: var(--dim); margin-top: 8px; line-height: 12px; padding: 0 12px; }
+  #diag { font-size: 8px; color: var(--dim); margin-top: 6px; }
+  #btns { position: absolute; left: 0; right: 0; bottom: 14px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; padding: 0 10px; }
+  button {
+    font-family: inherit; font-size: 10px; color: #161226; background: var(--gold);
+    border: 3px solid #161226; padding: 12px 14px; cursor: pointer;
+    box-shadow: 0 4px 0 #8a5a1c; border-radius: 0;
+  }
+  button:active { transform: translateY(3px); box-shadow: 0 1px 0 #8a5a1c; }
+  button:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
+  #enable { background: var(--blue); color: var(--ink); box-shadow: 0 4px 0 #1b2f78; display: none; }
+  #enable:active { box-shadow: 0 1px 0 #1b2f78; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="cv"></canvas>
+  <div id="hud">
+    <div id="result"></div>
+    <div id="combo"></div>
+  </div>
+  <div id="btns">
+    <button id="enable">Включить датчик</button>
+    <button id="roll">Бросить</button>
+  </div>
+</div>
+
+<script>
+(() => {
+'use strict';
+
+/* ====================== НАСТРОЙКИ (можно крутить) ====================== */
+const SHAKE_THRESHOLD = 70;   // чувствительность встряхивания (меньше = чувствительнее)
+const SHAKE_SECONDS   = 1.0;   // сколько секунд надо трясти
+const ROLL_MIN = 0.5, ROLL_MAX = 2.0; // длительность «качения» каждого кубика, сек
+const TILT_DEG = 22;           // наклон камеры от вертикали (0 = строго сверху)
+
+/* ====================== ГЕОМЕТРИЯ ====================== */
+const Z = 1.5;                          // во сколько раз повышено разрешение пиксель-арта
+const COLS = 4, ROWS = 5, S = 24 * Z;     // клетки лотка
+const h = 10 * Z;                          // половина ребра кубика
+const WALL = 6 * Z, WALLH = 8 * Z;             // толщина и высота бортика
+const FX = COLS * S / 2, FZ = ROWS * S / 2;
+const TILT = TILT_DEG * Math.PI / 180, CT = Math.cos(TILT), ST = Math.sin(TILT);
+
+/* ====================== ПАЛИТРА ====================== */
+const hex = s => { const n = parseInt(s.slice(1), 16); const r = n >> 16 & 255, g = n >> 8 & 255, b = n & 255; return (255 << 24) | (b << 16) | (g << 8) | r; };
+const C = {
+  bg: '#1b1830', bgDot: '#231f3b', shadowTray: '#120f20', out: '#161226',
+  felt: '#2f7a52', felt2: '#296c48',
+  woodL: '#c08448', woodHi: '#dca66a', woodM: '#8c5a32', woodD: '#5e3a22'
+};
+const WHITE = [hex('#f4f1e8'), hex('#d8d5ca'), hex('#b0aea8')];
+const BLUE  = [hex('#2f5bdc'), hex('#2849b5'), hex('#213c94')];
+const REDP  = [hex('#e23535'), hex('#bd2a2a'), hex('#9a2121')];
+const OUT   = hex(C.out);
+
+/* ====================== МАТЕМАТИКА ====================== */
+const I3 = [1,0,0, 0,1,0, 0,0,1];
+const mul = (a,b) => { const r = new Array(9); for (let i=0;i<3;i++) for (let j=0;j<3;j++) r[i*3+j] = a[i*3]*b[j] + a[i*3+1]*b[3+j] + a[i*3+2]*b[6+j]; return r; };
+const mv  = (a,v) => [a[0]*v[0]+a[1]*v[1]+a[2]*v[2], a[3]*v[0]+a[4]*v[1]+a[5]*v[2], a[6]*v[0]+a[7]*v[1]+a[8]*v[2]];
+const mtv = (a,v) => [a[0]*v[0]+a[3]*v[1]+a[6]*v[2], a[1]*v[0]+a[4]*v[1]+a[7]*v[2], a[2]*v[0]+a[5]*v[1]+a[8]*v[2]];
+const rot = (k,t) => { const c=Math.cos(t), s=Math.sin(t), q=1-c, x=k[0], y=k[1], z=k[2];
+  return [c+x*x*q, x*y*q-z*s, x*z*q+y*s,  y*x*q+z*s, c+y*y*q, y*z*q-x*s,  z*x*q-y*s, z*y*q+x*s, c+z*z*q]; };
+const SNAPV = [0, Math.SQRT1_2, 1];   // после поворотов на 90° и 45° в матрице бывают только 0, 0.707 и 1
+const snap1 = v => { const a = Math.abs(v); let best = 0, bd = 9; for (const c of SNAPV) { const dd = Math.abs(a - c); if (dd < bd) { bd = dd; best = c; } } return v < 0 ? -best : best; };
+const snap = a => a.map(snap1);
+const rand = (a,b) => a + Math.random() * (b - a);
+const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+const randAxis = () => { const z = rand(-1,1), t = rand(0, Math.PI*2), r = Math.sqrt(1 - z*z); return [r*Math.cos(t), r*Math.sin(t), z]; };
+function randOri() {
+  let m = I3; const axes = [[1,0,0],[0,1,0],[0,0,1]]; const n = 4 + (Math.random()*6|0);
+  for (let i=0;i<n;i++) m = snap(mul(rot(axes[Math.random()*3|0], (Math.PI/2) * (Math.random()<.5?1:-1)), m));
+  return m;
+}
+// Какое число сверху: локальные грани +Y=1, -Y=6, +X=2, -X=5, +Z=3, -Z=4 (противоположные дают 7)
+function topVal(R) {
+  for (let i=0;i<3;i++) { const y = R[3+i]; if (Math.abs(y) > .5) { const p = y > 0; return i===0 ? (p?2:5) : i===1 ? (p?1:6) : (p?3:4); } }
+  return 1;
+}
+
+/* ====================== КАНВАС И РАСКЛАДКА ====================== */
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const stage = document.getElementById('stage'), hud = document.getElementById('hud');
+let W, H, scale, offX, offY, bgC, frC, floorRect;
+
+const mk = (w,hh) => { const c = document.createElement('canvas'); c.width = w; c.height = hh; return c; };
+const projY = (y,z) => Math.round(offY + z*CT - y*ST);
+const projX = x => Math.round(offX + x);
+
+function buildStatic() {
+  bgC = mk(W,H); frC = mk(W,H);
+  const g = bgC.getContext('2d'), f = frC.getContext('2d');
+  const rect = (c, col, x0,y0,x1,y1) => { c.fillStyle = col; c.fillRect(x0, y0, x1-x0, y1-y0); };
+
+  rect(g, C.bg, 0,0,W,H);
+  g.fillStyle = C.bgDot;
+  for (let y=0;y<H;y++) for (let x=0;x<W;x++) if ((x*13 + y*7) % 29 === 0) g.fillRect(x,y,1,1);
+
+  const xL = projX(-FX-WALL), xR = projX(FX+WALL), fxL = projX(-FX), fxR = projX(FX);
+  const yFarTop = projY(WALLH, -FZ-WALL), yFarTopIn = projY(WALLH, -FZ), yFarFloor = projY(0, -FZ);
+  const yFloorBot = projY(0, FZ);
+  const yNearTopIn = projY(WALLH, FZ), yNearTopOut = projY(WALLH, FZ+WALL), yNearBase = projY(0, FZ+WALL);
+  floorRect = [fxL, yFarFloor, fxR, yFloorBot];
+
+  // тень лотка и контур
+  rect(g, C.shadowTray, xL+3, yFarTop+4, xR+3, yNearBase+4);
+  rect(g, C.out, xL-1, yFarTop-1, xR+1, yNearBase+1);
+  // боковые борта и дальний борт (верхние грани)
+  rect(g, C.woodL, xL, yFarTop, fxL, yNearTopOut);
+  rect(g, C.woodL, fxR, yFarTop, xR, yNearTopOut);
+  rect(g, C.woodL, xL, yFarTop, xR, yFarTopIn);
+  rect(g, C.woodHi, xL, yFarTop, xR, yFarTop+1);
+  rect(g, C.woodHi, xL, yFarTop, xL+1, yNearTopOut);
+  rect(g, C.woodM, xR-1, yFarTop, xR, yNearTopOut);
+  // внутренняя стенка дальнего борта
+  rect(g, C.woodD, fxL, yFarTopIn, fxR, yFarFloor);
+  // сукно
+  rect(g, C.felt, fxL, yFarFloor, fxR, yFloorBot);
+  g.fillStyle = C.felt2;
+  for (let y=yFarFloor; y<yFloorBot; y++) for (let x=fxL; x<fxR; x++) if ((x*3 + y*5) % 7 === 0) g.fillRect(x,y,1,1);
+  // тёмные внутренние линии
+  rect(g, C.out, fxL-1, yFarTopIn, fxL, yFloorBot);
+  rect(g, C.out, fxR, yFarTopIn, fxR+1, yFloorBot);
+  rect(g, C.out, fxL, yFarFloor-1, fxR, yFarFloor);
+
+  // передний борт (рисуется поверх кубиков)
+  rect(f, C.woodL, xL, yNearTopIn, xR, yNearTopOut);
+  rect(f, C.woodHi, xL, yNearTopIn, xR, yNearTopIn+1);
+  rect(f, C.out, fxL, yNearTopIn-1, fxR, yNearTopIn);
+  rect(f, C.woodM, xL, yNearTopOut, xR, yNearBase);
+  rect(f, C.woodD, xL, yNearBase-1, xR, yNearBase);
+  rect(f, C.out, xL-1, yNearBase, xR+1, yNearBase+1);
+  rect(f, C.out, xL-1, yNearTopIn-1, xL, yNearBase+1);
+  rect(f, C.out, xR, yNearTopIn-1, xR+1, yNearBase+1);
+
+  return yNearBase;
+}
+
+function layout() {
+  const cw = document.body.clientWidth, ch = document.body.clientHeight;
+  scale = Math.max(1, Math.round(Math.min(cw, 520) / (140 * Z)));
+  while (scale > 1 && (Math.min(cw, 520) / scale < 172 || ch / scale < 290)) scale--;
+  W = Math.floor(Math.min(cw, 520) / scale);
+  H = Math.floor(ch / scale);
+  cv.width = W; cv.height = H;
+  cv.style.width = W*scale + 'px'; cv.style.height = H*scale + 'px';
+  stage.style.width = W*scale + 'px'; stage.style.height = H*scale + 'px';
+  offX = Math.floor(W / 2);
+  offY = Math.round(82 * Z);
+  const bottom = buildStatic();
+  hud.style.top = (bottom + 12) * scale + 'px';
+}
+
+/* ====================== КУБИКИ ====================== */
+let rolling = false;
+const DIAG_START = 0.45;   // шанс, что кубик упадёт «ребром» (довёрнут на 45°)
+const TWIST_P = 0.3;       // шанс, что при перекате кубик довернётся на ±45°
+const UP = [0,1,0];
+const dice = [0,1,2].map(id => ({ id, visible: false, phase: 'idle', R: I3, Rv: I3, x: 0, y: h, z: 0, diag: false, yawV: 0 }));
+
+const PQ = .5, EDGE = 1 - 1.5 / h;
+const PIPS = {
+  1: [[0,0]],
+  2: [[-PQ,-PQ],[PQ,PQ]],
+  3: [[-PQ,-PQ],[0,0],[PQ,PQ]],
+  4: [[-PQ,-PQ],[PQ,-PQ],[-PQ,PQ],[PQ,PQ]],
+  5: [[-PQ,-PQ],[PQ,-PQ],[-PQ,PQ],[PQ,PQ],[0,0]],
+  6: [[-PQ,-PQ],[-PQ,0],[-PQ,PQ],[PQ,-PQ],[PQ,0],[PQ,PQ]]
+};
+const LIGHT = (() => { const v = [-.35,.85,.4]; const l = Math.hypot(...v); return v.map(a => a/l); })();
+
+function buildDurations(T) {
+  const b = rand(0.08, 0.22);          // базовая скорость вращения (у каждого кубика своя)
+  const durs = []; let sum = 0;
+  while (sum < T) { const d = b * (1 + 2 * Math.pow(sum / T, 1.5)); durs.push(d); sum += d; } // замедление к концу
+  const k = T / sum;
+  return durs.map(d => d * k);
+}
+
+const SQ = Math.SQRT1_2;
+// Кубик на столе — квадрат со стороной 2h, повёрнутый на 0° или 45° (diag).
+function sqExt(n, diag) {
+  const u1 = diag ? [SQ, SQ] : [1, 0], u2 = diag ? [-SQ, SQ] : [0, 1];
+  return h * (Math.abs(n[0]*u1[0] + n[1]*u1[1]) + Math.abs(n[0]*u2[0] + n[1]*u2[1]));
+}
+function squaresOverlap(a, b, gap) {
+  const dx = b.x - a.x, dz = b.z - a.z;
+  const axes = [a.diag ? [SQ,SQ] : [1,0], a.diag ? [-SQ,SQ] : [0,1], b.diag ? [SQ,SQ] : [1,0], b.diag ? [-SQ,SQ] : [0,1]];
+  for (const n of axes) if (Math.abs(dx*n[0] + dz*n[1]) > sqExt(n, a.diag) + sqExt(n, b.diag) + gap) return false;
+  return true;
+}
+function inBounds(x, z, diag) {
+  const m = (diag ? h * Math.SQRT2 : h) + .5;
+  return Math.abs(x) <= FX - m && Math.abs(z) <= FZ - m;
+}
+function blockers(d) {
+  const out = [];
+  dice.forEach(o => {
+    if (o === d) return;
+    if (o.phase === 'wait' || o.phase === 'fall') out.push({ x: o.tx, z: o.tz, diag: o.diag });
+    else if (o.phase === 'roll' || o.phase === 'rest') {
+      out.push({ x: o.x, z: o.z, diag: o.diag });
+      if (o.tipping) out.push({ x: o.ex, z: o.ez, diag: o.ndiag });
+    }
+  });
+  return out;
+}
+
+function startRoll() {
+  if (rolling) return;
+  rolling = true; shake = 0;
+  const placed = [];
+  dice.forEach(d => {
+    d.diag = Math.random() < DIAG_START;
+    const m = (d.diag ? h * Math.SQRT2 : h) + 1;
+    let x = 0, z = 0, tries = 0;
+    do { x = rand(-FX + m, FX - m); z = rand(-FZ + m, FZ - m); tries++; }
+    while (tries < 300 && placed.some(p => squaresOverlap({ x, z, diag: d.diag }, p, 3)));
+    placed.push({ x, z, diag: d.diag });
+    d.tx = x; d.tz = z;
+    d.x0 = d.tx + rand(-45,45) * Z; d.z0 = d.tz + rand(-45,45) * Z; d.y0 = rand(55,95) * Z;
+    d.delay = rand(0, .25); d.fallT = rand(.28,.4);
+    d.R = snap(mul(rot(UP, d.diag ? Math.PI/4 : 0), randOri()));
+    d.axis = randAxis(); d.phi0 = rand(1.5,3.5) * Math.PI * (Math.random()<.5?-1:1);
+    d.T = rand(ROLL_MIN, ROLL_MAX); d.durs = buildDurations(d.T);
+    d.tipIdx = 0; d.tipping = false; d.tipT = 0; d.lastAng = null; d.twist = 0; d.lastDur = null; d.tipType = 'roll'; d.bounces = 0;
+    d.yawV = d.diag ? Math.PI/4 : 0;
+    d.phase = 'wait'; d.t = 0; d.visible = false;
+  });
+  setText('result',''); setText('combo','');
+}
+
+/* ---- Удары о борт и другие кубики ---- */
+// Скорость = насколько быстро кубик делал последний переворот (чем короче переворот, тем быстрее).
+// При ударе: остановиться (лёгкий «стук»), сильно отскочить или просто свернуть в сторону.
+const P_STOP_SLOW = 0.65, P_STOP_FAST = 0.12;      // шанс остановиться: медленный -> быстрый
+const P_BOUNCE_SLOW = 0.10, P_BOUNCE_FAST = 0.55;  // шанс сильного отскока: медленный -> быстрый
+const normA = a => { a = a % (Math.PI*2); return a < 0 ? a + Math.PI*2 : a; };
+const sameA = (a, b) => { const x = Math.abs(normA(a) - normA(b)); return x < 1e-6 || Math.abs(x - Math.PI*2) < 1e-6; };
+
+function dirOK(d, a, nd, bl) {
+  const mx = Math.cos(a), mz = Math.sin(a), ex = d.x + 2*h*mx, ez = d.z + 2*h*mz;
+  if (!inBounds(ex, ez, nd)) return false;
+  const end = { x: ex, z: ez, diag: nd }, mid = { x: d.x + h*mx, z: d.z + h*mz, diag: d.diag };
+  return !bl.some(b => squaresOverlap(end, b, 1) || squaresOverlap(mid, b, -3));
+}
+function startNudge(d, a, sp) {
+  d.m = [Math.cos(a), Math.sin(a)]; d.ang = a; d.sx = d.x; d.sz = d.z; d.ex = d.x; d.ez = d.z;
+  d.ndiag = d.diag; d.twist = 0; d.tipType = 'nudge';
+  d.nudgeAmp = 0.10 + 0.20 * sp; d.tipDur = 0.16; d.tipping = true;
+}
+
+function beginTip(d) {
+  if (d.tipIdx >= d.durs.length) return false;
+  const base = d.diag ? Math.PI/4 : 0;
+  let angs = [0,1,2,3].map(i => base + i * Math.PI/2).sort(() => Math.random() - .5);
+  if (d.lastAng != null && Math.random() < .55) {
+    const idx = angs.findIndex(a => sameA(a, d.lastAng));
+    if (idx > 0) { const a = angs.splice(idx, 1)[0]; angs.unshift(a); }
+  }
+  const bl = blockers(d);
+  const want = angs[0];
+  if (!dirOK(d, want, d.diag, bl)) {                       // упёрся в борт или кубик
+    const lastDur = d.lastDur || d.durs[d.tipIdx];
+    const sp = clamp(1 - (lastDur - 0.08) / 0.30, 0, 1);   // 0 = медленно, 1 = быстро
+    const pStop = P_STOP_SLOW + (P_STOP_FAST - P_STOP_SLOW) * sp;
+    const pBounce = P_BOUNCE_SLOW + (P_BOUNCE_FAST - P_BOUNCE_SLOW) * sp;
+    const r = Math.random();
+    if (r < pStop) { startNudge(d, want, sp); return true; }
+    if (r < pStop + pBounce && (d.bounces || 0) < 2) {   // не больше двух сильных отскоков за бросок
+      const ok = [want + Math.PI, Math.PI - want, -want]
+        .filter(a => !sameA(a, want))
+        .map(a => angs.find(b => sameA(a, b)))
+        .filter(a => a !== undefined && dirOK(d, a, d.diag, bl));
+      if (ok.length) {
+        const a = ok[Math.random() * ok.length | 0];
+        angs = [a, ...angs.filter(b => !sameA(a, b))];
+        const e0 = clamp(lastDur * 0.85, 0.09, 0.26), n = sp > 0.5 ? 2 : 1;   // отскок = дополнительные перевороты
+        const extras = []; for (let i = 0; i < n; i++) extras.push(e0 * (1 + 0.4 * i));
+        d.durs.splice(d.tipIdx, 0, ...extras); d.bounces = (d.bounces || 0) + 1;
+      }
+    }
+    // иначе: просто сворачивает в свободную сторону (как раньше)
+  }
+  const twists = Math.random() < TWIST_P ? [(Math.random() < .5 ? 1 : -1) * Math.PI/4, 0] : [0];
+  for (const tw of twists) {
+    const nd = tw !== 0 ? !d.diag : d.diag;
+    for (const a of angs) {
+      if (!dirOK(d, a, nd, bl)) continue;
+      const mx = Math.cos(a), mz = Math.sin(a);
+      d.m = [mx, mz]; d.ang = a; d.sx = d.x; d.sz = d.z; d.ex = d.x + 2*h*mx; d.ez = d.z + 2*h*mz;
+      d.ndiag = nd; d.twist = tw; d.tipType = 'roll';
+      d.tipDur = d.durs[d.tipIdx]; d.tipping = true;
+      return true;
+    }
+  }
+  return false;
+}
+function endTip(d) {
+  if (d.tipType === 'nudge') {                              // стук закончился — кубик замирает
+    d.x = d.sx; d.z = d.sz; d.y = h; d.tipping = false; d.tipIdx = d.durs.length;
+    return;
+  }
+  const [mx, mz] = d.m;
+  d.R = snap(mul(rot(UP, d.twist), mul(rot([mz,0,-mx], Math.PI/2), d.R)));   // переворот через ребро на 90°
+  d.x = d.ex; d.z = d.ez; d.y = h; d.diag = d.ndiag;
+  d.yawV = d.diag ? Math.PI/4 : 0;
+  d.lastAng = d.twist ? null : d.ang;
+  d.lastDur = d.tipDur;
+  d.tipIdx++; d.tipping = false;
+}
+function poseTip(d) {
+  const p = clamp(d.tipT / d.tipDur, 0, 1);
+  if (d.tipType === 'nudge') {                              // кубик чуть качнулся от препятствия и вернулся
+    const mx = -d.m[0], mz = -d.m[1], th = d.nudgeAmp * Math.sin(Math.PI * p);
+    const Rk = rot([mz,0,-mx], th);
+    d.Rv = mul(Rk, d.R);
+    const w = mv(Rk, [-mx*h, h, -mz*h]);
+    d.x = d.sx + mx*h + w[0]; d.y = w[1]; d.z = d.sz + mz*h + w[2];
+    return;
+  }
+  const [mx, mz] = d.m;
+  const th = (Math.PI/2) * (.45*p + .55*p*p);
+  const Rk = rot([mz,0,-mx], th);
+  d.Rv = mul(rot(UP, d.twist * p), mul(Rk, d.R));
+  const pv = [d.sx + mx*h, 0, d.sz + mz*h];
+  const w = mv(Rk, [-mx*h, h, -mz*h]);
+  d.x = pv[0] + w[0]; d.y = pv[1] + w[1]; d.z = pv[2] + w[2];
+  d.yawV = (d.diag ? Math.PI/4 : 0) + d.twist * p;
+}
+function settle(d) {
+  d.phase = 'rest'; d.tipping = false;
+  d.Rv = d.R; d.y = h; d.yawV = d.diag ? Math.PI/4 : 0;
+}
+
+function updateDie(d, dt) {
+  if (d.phase === 'idle' || d.phase === 'rest') return;
+  d.t += dt;
+  if (d.phase === 'wait') { if (d.t < d.delay) return; d.phase = 'fall'; d.t = 0; d.visible = true; }
+  if (d.phase === 'fall') {
+    const p = Math.min(1, d.t / d.fallT), q = 1 - (1-p)*(1-p);
+    d.y = h + (d.y0 - h) * (1 - p*p);
+    d.x = d.x0 + (d.tx - d.x0) * q; d.z = d.z0 + (d.tz - d.z0) * q;
+    d.Rv = mul(rot(d.axis, d.phi0 * (1-p)), d.R);
+    if (p < 1) return;
+    d.phase = 'roll'; d.tipT = 0; d.tipping = false; d.x = d.tx; d.z = d.tz; d.y = h; d.Rv = d.R;
+    return;
+  }
+  if (d.phase === 'roll') {
+    d.tipT += dt;
+    for (;;) {
+      if (!d.tipping && !beginTip(d)) { settle(d); return; }
+      if (d.tipT >= d.tipDur) { d.tipT -= d.tipDur; endTip(d); } else break;
+    }
+    poseTip(d);
+  }
+}
+
+/* ====================== ОТРИСОВКА КУБИКА (рейкаст по пикселям) ====================== */
+const SPR = 60, SH = SPR/2;
+const sprCv = mk(SPR, SPR), sctx = sprCv.getContext('2d');
+const sImg = sctx.createImageData(SPR, SPR), sBuf = new Uint32Array(sImg.data.buffer), sCopy = new Uint32Array(SPR*SPR);
+const o3 = new Float64Array(3);
+
+function drawDie(d) {
+  const sx = offX + d.x, sy = offY + d.z*CT - d.y*ST;
+  const ox = Math.round(sx) - SH, oy = Math.round(sy) - SH;
+  const R = d.Rv;
+  const A = mtv(R,[1,0,0]), B = mtv(R,[0,ST,-CT]), D = mtv(R,[0,-CT,-ST]);
+  sBuf.fill(0);
+  for (let j=0;j<SPR;j++) {
+    const b = (oy + j + .5) - sy;
+    for (let i=0;i<SPR;i++) {
+      const a = (ox + i + .5) - sx;
+      o3[0] = A[0]*a - B[0]*b; o3[1] = A[1]*a - B[1]*b; o3[2] = A[2]*a - B[2]*b;
+      let te = -1e9, tx = 1e9, ax = -1, miss = false;
+      for (let k=0;k<3;k++) {
+        const dk = D[k], ok = o3[k];
+        if (Math.abs(dk) < 1e-9) { if (Math.abs(ok) > h) { miss = true; break; } continue; }
+        let t1 = (-h - ok)/dk, t2 = (h - ok)/dk; if (t1 > t2) { const t = t1; t1 = t2; t2 = t; }
+        if (t1 > te) { te = t1; ax = k; }
+        if (t2 < tx) tx = t2;
+      }
+      if (miss || te >= tx || ax < 0) continue;
+      const s = D[ax] > 0 ? -1 : 1;
+      const p0 = o3[0] + D[0]*te, p1 = o3[1] + D[1]*te, p2 = o3[2] + D[2]*te;
+      let u, v, val;
+      if (ax === 1)      { u = p0/h; v = p2/h; val = s > 0 ? 1 : 6; }
+      else if (ax === 0) { u = p2/h; v = p1/h; val = s > 0 ? 2 : 5; }
+      else               { u = p0/h; v = p1/h; val = s > 0 ? 3 : 4; }
+      const nd = (R[ax]*LIGHT[0] + R[3+ax]*LIGHT[1] + R[6+ax]*LIGHT[2]) * s;
+      let lvl = nd > .6 ? 0 : nd > .15 ? 1 : 2;
+      let col = null;
+      const pips = PIPS[val], big = val === 1, r = big ? .4 : .22, r2 = r*r;
+      for (let q=0;q<pips.length;q++) { const du = u - pips[q][0], dv = v - pips[q][1]; if (du*du + dv*dv <= r2) { col = (val === 1 || val === 3) ? REDP[lvl] : BLUE[lvl]; break; } }
+      if (col === null) {
+        const edge = Math.abs(u) > EDGE || Math.abs(v) > EDGE;
+        col = WHITE[edge ? Math.min(2, lvl+1) : lvl];
+      }
+      sBuf[j*SPR + i] = col;
+    }
+  }
+  // контур
+  sCopy.set(sBuf);
+  for (let j=0;j<SPR;j++) for (let i=0;i<SPR;i++) {
+    if (sCopy[j*SPR+i] !== 0) continue;
+    if ((i>0 && sCopy[j*SPR+i-1]) || (i<SPR-1 && sCopy[j*SPR+i+1]) || (j>0 && sCopy[(j-1)*SPR+i]) || (j<SPR-1 && sCopy[(j+1)*SPR+i])) sBuf[j*SPR+i] = OUT;
+  }
+  sctx.putImageData(sImg, 0, 0);
+  ctx.drawImage(sprCv, ox, oy);
+}
+
+function drawShadow(d) {
+  const g = clamp(1 - (d.y - h) / (80 * Z), .35, 1);
+  const r = (h + 1) * g;
+  const cx = Math.round(offX + d.x) + 2, cy = Math.round(offY + d.z*CT) + 1;
+  const c = Math.cos(d.yawV), s = Math.sin(d.yawV);
+  const ext = Math.ceil(r * 1.45), extY = Math.ceil(ext * CT) + 1;
+  ctx.fillStyle = `rgba(10,8,24,${(.38 * g).toFixed(2)})`;
+  for (let py = -extY; py <= extY; py++) {
+    const zz = (py + .5) / CT;
+    let x0 = null, x1 = null;
+    for (let px = -ext; px <= ext; px++) {
+      const xx = px + .5;
+      const au = Math.abs(xx*c + zz*s), aw = Math.abs(-xx*s + zz*c);
+      if (au <= r && aw <= r && au + aw <= r * 1.7) { if (x0 === null) x0 = px; x1 = px; }
+    }
+    if (x0 !== null) ctx.fillRect(cx + x0, cy + py, x1 - x0 + 1, 1);
+  }
+}
+
+function render() {
+  ctx.drawImage(bgC, 0, 0);
+  const vis = dice.filter(d => d.visible).sort((a,b) => a.z - b.z);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(floorRect[0], floorRect[1], floorRect[2]-floorRect[0], floorRect[3]-floorRect[1]); ctx.clip();
+  vis.forEach(drawShadow);
+  ctx.restore();
+  vis.forEach(drawDie);
+  ctx.drawImage(frC, 0, 0);
+}
+
+/* ====================== КОМБИНАЦИИ ====================== */
+// Порядок кубиков не важен: ключ — цифры по возрастанию (541 -> '145').
+// cats = «коты» (бросить ещё раз после хода). Поле effect — пока только метка для будущей игровой механики.
+const COMBOS = {
+  '111': { name: 'Пыжи',          cats: true },
+  '222': { name: 'Пяточки',       cats: true, effect: 'six_for_start' },
+  '333': { name: 'Чижи',          cats: true },
+  '444': { name: 'Кроты',         cats: true, effect: 'teleport_between_houses' },
+  '555': { name: 'Цветы',         cats: true, effect: 'piece_to_finish_house' },
+  '666': { name: 'Сатана',        cats: true, effect: 'satan' },
+  '145': { name: 'Говно' },
+  '245': { name: 'Большая глина' },
+  '244': { name: 'Полугаевский',  cats: true, effect: 'polugaevsky_toggle_game' },
+  '455': { name: 'Бутоньерка',    cats: true }
+};
+function analyze(vals) {
+  const s = [...vals].sort((a,b) => a-b), key = s.join('');
+  const cats = s[0] === s[1] || s[1] === s[2];
+  const beard = s[1] === s[0] + 1 && s[2] === s[1] + 1;
+  const named = COMBOS[key];
+  if (named) return { key, name: named.name, cats: !!named.cats || cats, beard: false, effect: named.effect || null };
+  if (beard) return { key, name: 'Борода', cats: false, beard: true, effect: null };
+  if (cats)  return { key, name: 'Коты',   cats: true,  beard: false, effect: null };
+  return { key, name: '', cats: false, beard: false, effect: null };
+}
+window.BlohaDice = { roll: startRoll, analyze, COMBOS };
+
+/* ====================== ГЛАВНЫЙ ЦИКЛ ====================== */
+const $ = id => document.getElementById(id);
+const setText = (id, t) => { $(id).textContent = t; };
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(.05, (now - last) / 1000); last = now;
+  if (rolling) {
+    dice.forEach(d => updateDie(d, dt));
+    if (dice.every(d => d.phase === 'rest')) {
+      rolling = false;
+      const vals = dice.map(d => topVal(d.R));
+      setText('result', vals.join(' '));
+      setText('combo', analyze(vals).name);
+    }
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+
+/* ====================== ВСТРЯХИВАНИЕ ====================== */
+let shake = 0, lastA = null, lastT = 0, jerk = 0, gotMotion = false, motionOn = false, events = 0;
+function onMotion(e) {
+  events++;
+  const g = e.accelerationIncludingGravity;
+  const a = (g && g.x != null) ? g : e.acceleration;
+  if (!a || a.x == null) return;
+  gotMotion = true;
+  const now = performance.now();
+  if (!lastA) { lastA = {x:a.x, y:a.y, z:a.z}; lastT = now; return; }
+  const dt = (now - lastT) / 1000;
+  if (dt < .004) return;
+  const j = Math.hypot(a.x - lastA.x, a.y - lastA.y, a.z - lastA.z) / dt;
+  jerk += (j - jerk) * (1 - Math.exp(-dt / .12));
+  lastA = {x:a.x, y:a.y, z:a.z}; lastT = now;
+  if (rolling) { shake = 0; return; }
+  if (jerk > SHAKE_THRESHOLD) shake += dt; else shake = Math.max(0, shake - dt * 1.5);
+  if (shake >= SHAKE_SECONDS) startRoll();
+}
+function listenMotion() {
+  if (motionOn) return; motionOn = true;
+  window.addEventListener('devicemotion', onMotion);
+  setTimeout(() => { if (!gotMotion) tryGenericSensor(); }, 2500);
+}
+function tryGenericSensor() {
+  try {
+    if (typeof Accelerometer === 'undefined') return;
+    const s = new Accelerometer({ frequency: 60 });
+    s.addEventListener('reading', () => onMotion({ accelerationIncludingGravity: { x: s.x, y: s.y, z: s.z } }));
+    s.addEventListener('error', () => {});
+    s.start();
+  } catch (err) { /* датчик недоступен — остаётся кнопка */ }
+}
+async function enableMotion() {
+  try {
+    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+      const r = await DeviceMotionEvent.requestPermission();
+      if (r !== 'granted') return;
+    }
+    $('enable').style.display = 'none';
+    listenMotion();
+  } catch (err) { /* остаётся кнопка */ }
+}
+
+/* ====================== СТАРТ ====================== */
+$('roll').addEventListener('click', startRoll);
+$('enable').addEventListener('click', enableMotion);
+window.addEventListener('keydown', e => { if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); startRoll(); } });
+window.addEventListener('resize', layout);
+
+layout();
+if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+  $('enable').style.display = '';   // только iPhone: Apple требует нажатие для доступа к датчику
+} else if (typeof DeviceMotionEvent !== 'undefined') {
+  listenMotion();
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
