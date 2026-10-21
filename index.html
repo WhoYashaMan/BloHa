@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Блоха — дайс-трей v3b</title>
+<title>Блоха — дайс-трей v3c</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%B2%3C/text%3E%3C/svg%3E">
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
 <style>
@@ -396,8 +396,9 @@ function updateDie(d, dt) {
 
 /* ====================== ОТРИСОВКА КУБИКА (рейкаст по пикселям) ====================== */
 const SPR = 60, SH = SPR/2;
-const sprCv = mk(SPR, SPR), sctx = sprCv.getContext('2d');
-const sImg = sctx.createImageData(SPR, SPR), sBuf = new Uint32Array(sImg.data.buffer), sCopy = new Uint32Array(SPR*SPR);
+// У каждого кубика свой холст-спрайт: Safari на iPad путает один общий холст, если рисовать с него несколько раз за кадр
+const sprites = [0,1,2].map(() => { const c = mk(SPR, SPR), x = c.getContext('2d'), im = x.createImageData(SPR, SPR); return { c, x, im, buf: new Uint32Array(im.data.buffer) }; });
+const sCopy = new Uint32Array(SPR*SPR);
 const o3 = new Float64Array(3);
 
 function drawDie(d) {
@@ -405,6 +406,7 @@ function drawDie(d) {
   const ox = Math.round(sx) - SH, oy = Math.round(sy) - SH;
   const R = d.Rv;
   const A = mtv(R,[1,0,0]), B = mtv(R,[0,ST,-CT]), D = mtv(R,[0,-CT,-ST]);
+  const sp = sprites[d.id], sBuf = sp.buf;
   sBuf.fill(0);
   for (let j=0;j<SPR;j++) {
     const b = (oy + j + .5) - sy;
@@ -444,8 +446,8 @@ function drawDie(d) {
     if (sCopy[j*SPR+i] !== 0) continue;
     if ((i>0 && sCopy[j*SPR+i-1]) || (i<SPR-1 && sCopy[j*SPR+i+1]) || (j>0 && sCopy[(j-1)*SPR+i]) || (j<SPR-1 && sCopy[(j+1)*SPR+i])) sBuf[j*SPR+i] = OUT;
   }
-  sctx.putImageData(sImg, 0, 0);
-  ctx.drawImage(sprCv, ox, oy);
+  sp.x.putImageData(sp.im, 0, 0);
+  ctx.drawImage(sp.c, ox, oy);
 }
 
 function drawShadow(d) {
